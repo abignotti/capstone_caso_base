@@ -46,11 +46,16 @@ def simulate(aircraft: List[Aircraft],
              weeks: int = 260) -> tuple[pd.DataFrame, dict]:
 
     costs = {"lease": 0}
-    rows = []
-    EPS = 1.0           # margen de seguridad de 1 ciclo
+    rows  = []
+    EPS   = 1.0
+    lease_counter = 0            # ids únicos: LEASE-w-n
 
     for w in range(weeks):
-        # 1) avanzar y detectar motores que superan límite (doble chequeo)
+
+        # ----------------------------------------------------------
+        # 1) Avanzar ciclos y retirar motores que llegan (o llegarían)
+        #    al límite esta semana
+        # ----------------------------------------------------------
         motors_out = []
         for ac in aircraft:
             mot = ac.motor
@@ -58,73 +63,72 @@ def simulate(aircraft: List[Aircraft],
                 continue
 
             limit = MAX_LIMIT[base_family(ac.family)]
-
-            # (a) ¿ya está sobre el límite?
-            if mot.cycles >= limit - EPS:         #  <= margen
+            if mot.cycles >= limit - EPS \
+               or mot.cycles + ac.cycles_per_week >= limit - EPS:
                 motors_out.append(mot)
                 mot.installed_on = None
                 ac.motor = None
-                continue
+            else:
+                mot.cycles += ac.cycles_per_week
 
-            # (b) ¿se pasaría si suma la semana completa?
-            if mot.cycles + ac.cycles_per_week >= limit - EPS:
-                motors_out.append(mot)            # también lo retiro preventivo
-                mot.installed_on = None
-                ac.motor = None
-                continue
-
-            # (c) caso normal: volar
-            mot.cycles += ac.cycles_per_week
-
-
-        # 2) enviar a mantenimiento
+        # 2) Enviar a mantenimiento --------------------------------
         for m in motors_out:
             m.weeks_left_maint = MAINT_WEEKS
             if m not in inventory:
                 inventory.append(m)
 
-        # 3) progresar mantenimiento y armar pool listo
+        # 3) Progresar mantenimiento y construir ready_pool --------
         ready_pool = []
         for m in inventory:
             if m.weeks_left_maint > 0:
                 m.weeks_left_maint -= 1
             if m.weeks_left_maint == 0 and m.installed_on is None:
+                m.cycles = 0
                 ready_pool.append(m)
 
-        # 4) asignar motores faltantes
+        # 4) Asignar motores faltantes -----------------------------
         for ac in [a for a in aircraft if a.motor is None]:
             mot = next((m for m in ready_pool if compatible(m, ac)), None)
             if mot:
                 ready_pool.remove(mot)
-            if mot in inventory:
-                inventory.remove(mot)
+                inventory.remove(mot)          # sale del inventario
             else:
-                mot = Motor(id=f"LEASE-{w}-{len(inventory)}",
+                # crear motor arrendado válido solo 1 semana
+                mot = Motor(id=f"LEASE-{w}-{lease_counter}",
                             family=ac.family,
                             category=ac.category,
                             cycles=0,
                             is_leased=True)
-                costs["lease"] += LEASE_PRICE
-                inventory.append(mot)
-            
-            # --- Reset si cambia de familia base (A320 -> A321, B767F -> B767J) ---
+                lease_counter += 1
+                costs["lease"] += LEASE_PRICE   # cobrar UNA semana
+
+            # reset de familia si cambia
             if base_family(mot.family) != base_family(ac.family):
-                mot.cycles = 0                 # comienza “en cero” en la nueva familia
-                mot.family = ac.family         # actualiza la etiqueta del motor
+                mot.cycles = 0
+                mot.family = ac.family
 
             mot.installed_on = ac.id
             ac.motor = mot
 
-        # 5) registro semanal
+        # 5) Registrar calendario (antes de devolver arrendados) ---
         for ac in aircraft:
             rows.append({
                 "week": w,
                 "aircraft": ac.id,
-                "motor": ac.motor.id,
-                "is_leased": ac.motor.is_leased
+                "motor": ac.motor.id if ac.motor else "NONE",
+                "is_leased": ac.motor.is_leased if ac.motor else False,
+                "cycles"   : round(ac.motor.cycles, 1) if ac.motor else 0
             })
 
-    return pd.DataFrame(rows), costs
+        # 6) Devolver arrendados al proveedor ----------------------
+        for ac in aircraft:
+            if ac.motor and ac.motor.is_leased:
+                ac.motor.installed_on = None
+                ac.motor = None
+
+
+    return pd.DataFrame(rows), costs 
+
 
 
 if __name__ == "__main__":
